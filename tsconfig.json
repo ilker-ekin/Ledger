@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    // Type-check only — Node runs the .ts files directly by stripping types.
+    "noEmit": true,
+    "strict": true,
+    "target": "esnext",
+    "module": "nodenext",
+    "types": ["node"],
+
+    // Reject anything Node's type stripping can't run as-is.
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
