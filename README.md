@@ -1,0 +1,150 @@
+# Ledger
+
+A hands-on Kafka demo. User activity — orders, payments, tier changes — is
+recorded as a **permanent, ordered event log**. Two independent readers
+process that log at their own pace, one live and one in batches, and the log
+can be **replayed** to rebuild state from scratch.
+
+Ledger is the companion to [Bouncer](https://github.com/ilker-ekin/Bouncer),
+which uses RabbitMQ for real-time request prioritization. The two projects
+exist to contrast the models:
+
+| | Bouncer (RabbitMQ) | Ledger (Kafka) |
+|---|---|---|
+| A message is… | a request waiting to be handled | a fact that already happened |
+| After it's read | deleted | kept on the log |
+| Ordering | by priority | strict, per partition key |
+| Multiple readers | each needs its own copy (fanout) | one copy, each group keeps its own position |
+| Re-reading old messages | impossible | replay: move a group's position back |
+
+## How it works
+
+```
+ producer                 Kafka topic: ledger-events           consumer groups
+ (src/producer.ts)        (3 partitions, key = userId)
+                          ┌────────────────────────┐
+ order.created    ──────► │ partition 0            │ ──► live   — always running, per-user view
+ payment.processed        │ partition 1            │
+ user.tier_changed        │ partition 2            │ ──► batch  — runs occasionally, hourly rollup
+                          └────────────────────────┘
+                          events stay after being read
+```
+
+- **Producer** publishes JSON events keyed by `userId`. The same user always
+  lands on the same partition, so each user's events stay in order.
+- **live** consumer keeps an in-memory view per user (orders, total paid,
+  tier) and updates it on every event.
+- **batch** consumer starts, reads everything since its last run, prints an
+  hourly rollup, commits its position, and exits — like a cron job.
+- Each **consumer group** tracks its own position (offset), so the two never
+  affect each other. Stop one, and the other keeps going; the stopped one
+  catches up later from where it left off.
+
+Every event has the same envelope:
+
+```json
+{
+  "eventId": "7f3c9a2e-…",
+  "type": "payment.processed",
+  "userId": "user-3",
+  "occurredAt": "2026-09-28T10:15:00.000Z",
+  "data": { "orderId": "order-3", "amountCents": 12000 }
+}
+```
+
+## Running it
+
+**Requirements:** Docker, and Node.js 24+ (TypeScript runs directly through
+Node's built-in type stripping — there is no build step).
+
+```bash
+# 1. Start a single Kafka broker (KRaft mode, localhost only)
+docker compose up -d
+
+# 2. Create the topic (auto-creation is disabled on purpose)
+docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 \
+  --create --topic ledger-events --partitions 3 --replication-factor 1
+
+# 3. Install dependencies
+npm install
+```
+
+npm 11 may warn that the Kafka client's install script was not run. That's
+fine — the package ships a prebuilt native binary.
+
+## The three demos
+
+### 1. Same key, same partition
+
+```bash
+node src/producer.ts
+```
+
+Publishes 14 events for 6 users and prints where each landed. Every event for
+a given user shows the same partition.
+
+### 2. Independent consumer groups
+
+```bash
+# Terminal A — keep running
+node src/live-consumer.ts
+
+# Terminal B
+node src/producer.ts       # live prints the new events immediately
+node src/producer.ts       # batch isn't running, so it falls behind
+node src/batch-consumer.ts # batch processes exactly what it missed, then exits
+```
+
+Check each group's position and lag at any time:
+
+```bash
+docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --describe --group batch
+```
+
+To see at-least-once delivery, run batch with `CRASH_BEFORE_COMMIT=1`: it
+prints the rollup but exits before saving its position, so the next run
+processes the same events again.
+
+### 3. Replay
+
+live's view is in memory, so after a restart it only sees new events and its
+totals are wrong. The events that built the correct view are still on the
+log — move the group's position back and rebuild:
+
+```bash
+# Stop live first (Ctrl+C) — offsets can't be reset while the group is active
+docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --group live --topic ledger-events --reset-offsets --to-earliest --dry-run
+
+# Looks right? Apply it:
+docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --group live --topic ledger-events --reset-offsets --to-earliest --execute
+
+node src/live-consumer.ts  # reprocesses every event and rebuilds correct views
+```
+
+Nothing is re-sent by the producer — only the group's position moves.
+
+## Design decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Broker | Confluent `cp-kafka` in KRaft mode, single node | Real Kafka, including its own consensus — no ZooKeeper |
+| Partitions | 3 | Smallest count that shows key routing and consumer parallelism |
+| Partition key | `userId` | Keeps each user's order → payment → tier change in order |
+| Event format | Plain JSON envelope | One small schema; no registry needed |
+| Client | `@confluentinc/kafka-javascript` | Maintained, and partitions keys the same way the Java client does |
+| Producer | Idempotent, `acks=all` | Retries can't duplicate or reorder events |
+| Delivery | At-least-once | Nothing is lost; duplicates are detectable via `eventId` |
+| New groups start at | The beginning of the log | The history is the point |
+
+## Deliberately out of scope
+
+Schema registry, exactly-once transactions, multiple brokers, security
+(TLS/SASL/ACLs — the broker is bound to localhost instead), persistent read
+models, and metrics. This is a learning project on a single local broker.
+
+## License
+
+[MIT](LICENSE)
