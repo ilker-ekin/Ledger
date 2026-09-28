@@ -2,7 +2,9 @@ services:
   kafka:
     image: confluentinc/cp-kafka:8.0.0
     ports:
-      - "9092:9092"
+      # Bind to loopback only — the broker has no auth, so it must not be
+      # reachable from other machines on the network.
+      - "127.0.0.1:9092:9092"
     environment:
       # KRaft identity — a single node acting as both broker and controller.
       # NODE_ID and CLUSTER_ID are written to storage on first start; never change them.
