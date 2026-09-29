@@ -126,6 +126,27 @@ node src/live-consumer.ts  # reprocesses every event and rebuilds correct views
 
 Nothing is re-sent by the producer — only the group's position moves.
 
+## Monitoring lag
+
+**Lag** is how far behind a consumer group is: the end of the log minus the
+group's saved position, per partition. Kafka doesn't store it — it's
+calculated on demand.
+
+```bash
+node src/lag.ts           # print each group's lag once
+node src/lag.ts --watch   # redraw every 2 seconds (Ctrl+C to stop)
+```
+
+```
+ group    p0    p1    p2 total
+  live     0     0     0     0
+ batch     0    25    45    70
+```
+
+The same number means different things per group: growing lag is normal for
+batch between runs, but lag that stays above zero for live means it's stuck or
+has crashed.
+
 ## Design decisions
 
 | Decision | Choice | Why |
@@ -143,7 +164,8 @@ Nothing is re-sent by the producer — only the group's position moves.
 
 Schema registry, exactly-once transactions, multiple brokers, security
 (TLS/SASL/ACLs — the broker is bound to localhost instead), persistent read
-models, and metrics. This is a learning project on a single local broker.
+models, and metrics dashboards. This is a learning project on a single local
+broker.
 
 ## License
 
