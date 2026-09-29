@@ -32,8 +32,11 @@ exist to contrast the models:
 
 - **Producer** publishes JSON events keyed by `userId`. The same user always
   lands on the same partition, so each user's events stay in order.
-- **live** consumer keeps an in-memory view per user (orders, total paid,
-  tier) and updates it on every event.
+- **live** consumer keeps a view per user (orders, total paid, tier) in a
+  local SQLite file (`data/live.db`). Each event updates the view *and* the
+  saved position in one transaction, so the two can never disagree — the view
+  survives restarts and rebalances, and a redelivered event is never applied
+  twice.
 - **batch** consumer starts, reads everything since its last run, prints an
   hourly rollup, commits its position, and exits — like a cron job.
 - Each **consumer group** tracks its own position (offset), so the two never
@@ -108,23 +111,32 @@ processes the same events again.
 
 ### 3. Replay
 
-live's view is in memory, so after a restart it only sees new events and its
-totals are wrong. The events that built the correct view are still on the
-log — move the group's position back and rebuild:
+Events stay on the log after being read, so a group can go back and read them
+again. Move batch's position back to the start:
 
 ```bash
-# Stop live first (Ctrl+C) — offsets can't be reset while the group is active
+# Offsets can't be reset while the group is active (batch exits on its own)
 docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group live --topic ledger-events --reset-offsets --to-earliest --dry-run
+  --group batch --topic ledger-events --reset-offsets --to-earliest --dry-run
 
 # Looks right? Apply it:
 docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group live --topic ledger-events --reset-offsets --to-earliest --execute
+  --group batch --topic ledger-events --reset-offsets --to-earliest --execute
 
-node src/live-consumer.ts  # reprocesses every event and rebuilds correct views
+node src/batch-consumer.ts  # reprocesses every event on the log
 ```
 
 Nothing is re-sent by the producer — only the group's position moves.
+
+live works differently: its position is stored in SQLite alongside its view,
+so resetting its Kafka offsets has no effect. To rebuild live's view from the
+log, stop it and delete its database — on the next start it finds no saved
+position and replays every partition from the beginning:
+
+```bash
+rm data/live.db
+node src/live-consumer.ts
+```
 
 ## Monitoring lag
 
@@ -163,9 +175,9 @@ has crashed.
 ## Deliberately out of scope
 
 Schema registry, exactly-once transactions, multiple brokers, security
-(TLS/SASL/ACLs — the broker is bound to localhost instead), persistent read
-models, and metrics dashboards. This is a learning project on a single local
-broker.
+(TLS/SASL/ACLs — the broker is bound to localhost instead), consumer state
+shared across machines, and metrics dashboards. This is a learning project on
+a single local broker.
 
 ## License
 
