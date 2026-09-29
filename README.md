@@ -37,8 +37,10 @@ exist to contrast the models:
   saved position in one transaction, so the two can never disagree — the view
   survives restarts and rebalances, and a redelivered event is never applied
   twice.
-- **batch** consumer starts, reads everything since its last run, prints an
-  hourly rollup, commits its position, and exits — like a cron job.
+- **batch** consumer starts, reads everything since its last run, adds it to
+  stored hourly totals (`data/batch.db`), and exits — like a cron job. The
+  totals and the position they cover are saved in one transaction per run,
+  so a crash can never make it count an event twice.
 - Each **consumer group** tracks its own position (offset), so the two never
   affect each other. Stop one, and the other keeps going; the stopped one
   catches up later from where it left off.
@@ -105,37 +107,40 @@ docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:909
   --describe --group batch
 ```
 
-To see at-least-once delivery, run batch with `CRASH_BEFORE_COMMIT=1`: it
-prints the rollup but exits before saving its position, so the next run
-processes the same events again.
+To see why saving state and position together matters, run batch with
+`CRASH_BEFORE_COMMIT=1`: it reads everything, then crashes before its
+transaction commits. SQLite rolls it back, so neither the totals nor the
+position are saved — the next run processes the same events exactly once.
 
 ### 3. Replay
 
 Events stay on the log after being read, so a group can go back and read them
-again. Move batch's position back to the start:
+again — only its bookmark (committed offset) moves; nothing is re-sent. Try it
+with a throwaway group:
 
 ```bash
-# Offsets can't be reset while the group is active (batch exits on its own)
-docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group batch --topic ledger-events --reset-offsets --to-earliest --dry-run
+# Read everything as group "replay-demo" — it saves a bookmark at the end
+docker compose exec kafka kafka-console-consumer --bootstrap-server localhost:9092 \
+  --topic ledger-events --group replay-demo --from-beginning --timeout-ms 5000
 
-# Looks right? Apply it:
-docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group batch --topic ledger-events --reset-offsets --to-earliest --execute
+# Run the same command again: nothing — the group resumes from its bookmark
 
-node src/batch-consumer.ts  # reprocesses every event on the log
+# Move the bookmark back to the start (drop --execute for a dry run)
+docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --group replay-demo --topic ledger-events --reset-offsets --to-earliest --execute
+
+# Run the read command again: every event comes back
 ```
 
-Nothing is re-sent by the producer — only the group's position moves.
-
-live works differently: its position is stored in SQLite alongside its view,
-so resetting its Kafka offsets has no effect. To rebuild live's view from the
-log, stop it and delete its database — on the next start it finds no saved
-position and replays every partition from the beginning:
+live and batch work differently: each stores its own position in SQLite next
+to its state, so resetting their Kafka offsets has no effect. For them, replay
+means rebuilding the derived state — delete the database, and on the next
+start they find no saved position and replay every partition from the
+beginning:
 
 ```bash
-rm data/live.db
-node src/live-consumer.ts
+rm data/live.db    # live rebuilds every user's view
+rm data/batch.db   # batch rebuilds every hourly total
 ```
 
 ## Monitoring lag
@@ -169,7 +174,8 @@ has crashed.
 | Event format | Plain JSON envelope | One small schema; no registry needed |
 | Client | `@confluentinc/kafka-javascript` | Maintained, and partitions keys the same way the Java client does |
 | Producer | Idempotent, `acks=all` | Retries can't duplicate or reorder events |
-| Delivery | At-least-once | Nothing is lost; duplicates are detectable via `eventId` |
+| Delivery | At-least-once | Nothing is lost; Kafka may deliver an event twice |
+| Consumer state | SQLite, saved in the same transaction as the consumer's position | State and position can't disagree, so each event takes effect exactly once |
 | New groups start at | The beginning of the log | The history is the point |
 
 ## Deliberately out of scope
