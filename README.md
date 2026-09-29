@@ -57,6 +57,17 @@ Every event has the same envelope:
 }
 ```
 
+## Project structure
+
+```
+docker-compose.yml       single Kafka broker (KRaft mode, bound to localhost)
+src/producer.ts          publishes a fixed scenario of 14 events for 6 users
+src/live-consumer.ts     group "live": per-user view, updated on every event
+src/batch-consumer.ts    group "batch": hourly totals, runs until caught up
+src/lag.ts               prints each group's lag (optionally every 2s)
+data/                    SQLite state for live and batch (git-ignored, created on first run)
+```
+
 ## Running it
 
 **Requirements:** Docker, and Node.js 24+ (TypeScript runs directly through
@@ -66,9 +77,9 @@ Node's built-in type stripping — there is no build step).
 # 1. Start a single Kafka broker (KRaft mode, localhost only)
 docker compose up -d
 
-# 2. Create the topic (auto-creation is disabled on purpose)
+# 2. Create the topic (auto-creation is disabled on purpose; safe to re-run)
 docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 \
-  --create --topic ledger-events --partitions 3 --replication-factor 1
+  --create --if-not-exists --topic ledger-events --partitions 3 --replication-factor 1
 
 # 3. Install dependencies
 npm install
@@ -76,6 +87,13 @@ npm install
 
 npm 11 may warn that the Kafka client's install script was not run. That's
 fine — the package ships a prebuilt native binary.
+
+Node runs the TypeScript files without checking their types, so check them
+separately after making changes:
+
+```bash
+npm run typecheck
+```
 
 ## The three demos
 
@@ -107,10 +125,18 @@ docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:909
   --describe --group batch
 ```
 
-To see why saving state and position together matters, run batch with
-`CRASH_BEFORE_COMMIT=1`: it reads everything, then crashes before its
-transaction commits. SQLite rolls it back, so neither the totals nor the
-position are saved — the next run processes the same events exactly once.
+To see why saving state and position together matters, make batch crash
+halfway:
+
+```bash
+CRASH_BEFORE_COMMIT=1 node src/batch-consumer.ts  # reads everything, then crashes
+node src/batch-consumer.ts                        # processes the same events, once
+```
+
+The crash happens before batch's transaction commits, so SQLite rolls it
+back — neither the totals nor the position are saved, and nothing is counted
+twice. Wait about 30 seconds between the two commands (see
+[Troubleshooting](#troubleshooting)).
 
 ### 3. Replay
 
@@ -163,6 +189,37 @@ node src/lag.ts --watch   # redraw every 2 seconds (Ctrl+C to stop)
 The same number means different things per group: growing lag is normal for
 batch between runs, but lag that stays above zero for live means it's stuck or
 has crashed.
+
+## Stopping and cleaning up
+
+```bash
+docker compose stop      # stop the broker, keep all events and group positions
+docker compose up -d     # start it again later
+
+docker compose down -v   # delete the broker and every event
+rm -r data/              # delete live's and batch's saved state
+```
+
+After `down -v`, repeat the setup steps — the topic has to be created again.
+Delete `data/` as well, or live and batch will try to resume from positions
+on a log that no longer exists.
+
+## Troubleshooting
+
+- **Warnings like `Connection to node -1 … could not be established` right
+  after `docker compose up -d`.** The broker takes 10–20 seconds to start.
+  The command keeps retrying and succeeds once the broker is ready; if it
+  gives up, run it again.
+- **`Topic 'ledger-events' already exists`.** The topic was created on an
+  earlier run and is still there. Nothing to do — the setup command above
+  uses `--if-not-exists` to skip this.
+- **A consumer starts but prints nothing for ~30 seconds after a crash.** A
+  consumer that was killed (not stopped with Ctrl+C) stays registered in its
+  group until its session times out (30 seconds for this client). Its
+  partitions are handed out only after that. Stop consumers with Ctrl+C to
+  avoid the wait.
+- **`--reset-offsets` fails because the group is active.** Offsets can only
+  be reset while no consumer in that group is running. Stop it first.
 
 ## Design decisions
 
